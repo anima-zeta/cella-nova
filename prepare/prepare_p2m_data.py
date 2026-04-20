@@ -49,6 +49,43 @@ logger = logging.getLogger(__name__)
 # SMILES character set for validation
 SMILES_CHARS = set("CNOPSFIBrcnopsfi[]()=#@+-.0123456789%\\/lHaeKgZdVuytMwACGTb")
 
+# Interaction type class definitions
+INTERACTION_TYPE_LABELS = {
+    0: "INHIBITOR",   # inhibitor, antagonist, blocker, inverse agonist
+    1: "ACTIVATOR",   # activator, agonist, opener, positive modulator
+    2: "MODULATOR",   # allosteric modulator, partial agonist (unclear direction)
+    3: "OTHER",       # substrate, unknown, or no data
+}
+
+# ChEMBL action_type string → interaction type class index
+CHEMBL_ACTION_TO_TYPE: Dict[str, int] = {
+    "INHIBITOR": 0,
+    "ANTAGONIST": 0,
+    "INVERSE AGONIST": 0,
+    "BLOCKER": 0,
+    "NEGATIVE MODULATOR": 0,
+    "AGONIST": 1,
+    "PARTIAL AGONIST": 1,
+    "ACTIVATOR": 1,
+    "OPENER": 1,
+    "POSITIVE MODULATOR": 1,
+    "ALLOSTERIC MODULATOR": 2,
+    "MODULATOR": 2,
+    "SUBSTRATE": 3,
+    "OTHER": 3,
+    "UNKNOWN": 3,
+}
+
+# Fallback: infer from standard activity measurement type
+ACTIVITY_TYPE_TO_INTERACTION_TYPE: Dict[str, int] = {
+    "IC50": 0,   # inhibitory concentration → inhibitor
+    "Ki":   0,   # inhibition constant → inhibitor
+    "GI50": 0,   # growth inhibition → inhibitor
+    "MIC":  0,   # minimum inhibitory concentration → inhibitor
+    "EC50": 1,   # effective concentration → activator/agonist
+    "Kd":   3,   # dissociation constant — direction unclear
+}
+
 
 @dataclass
 class ProteinInfo:
@@ -91,6 +128,8 @@ class InteractionPair:
     affinity: float = 0.0  # Binding affinity (e.g., pIC50, pKd)
     source: str = "ChEMBL"
     activity_type: Optional[str] = None  # e.g., "IC50", "Ki", "Kd"
+    interaction_type: int = 3        # 0=INHIBITOR, 1=ACTIVATOR, 2=MODULATOR, 3=OTHER
+    molecule_id: Optional[str] = None  # ChEMBL molecule ID for mechanism lookup
 
 
 @dataclass
@@ -479,6 +518,41 @@ class PMolDataPreparer:
 
         return True
 
+    @staticmethod
+    def infer_interaction_type(
+        activity_type: Optional[str],
+        mechanism: Optional[str],
+    ) -> int:
+        """
+        Resolve an interaction type class (0-3) from available data.
+        ChEMBL mechanism data takes priority; activity_type is the fallback.
+        """
+        if mechanism:
+            return CHEMBL_ACTION_TO_TYPE.get(mechanism.strip().upper(), 3)
+        if activity_type:
+            return ACTIVITY_TYPE_TO_INTERACTION_TYPE.get(activity_type.strip().upper(), 3)
+        return 3  # OTHER / unknown
+
+    def load_mechanisms(self) -> Dict[str, str]:
+        """
+        Load ChEMBL mechanism-of-action data from mechanisms.json if available.
+        Returns dict: {molecule_chembl_id: action_type_string}
+        """
+        # Search common locations
+        search_dirs = [
+            self.data_dir / "molecules",
+            self.data_dir,
+        ]
+        for d in search_dirs:
+            path = d / "mechanisms.json"
+            if path.exists():
+                with open(path) as f:
+                    data = json.load(f)
+                logger.info(f"  ✓ Loaded mechanism data for {len(data):,} molecules from {path}")
+                return data
+        logger.info("  ℹ No mechanisms.json found — will infer from activity type only")
+        return {}
+
     def load_interactions(self) -> int:
         """Load protein-molecule interactions from various sources"""
         logger.info("Loading protein-molecule interactions...")
@@ -519,6 +593,8 @@ class PMolDataPreparer:
                 label_idx = None
                 affinity_idx = None
                 source_idx = None
+                interaction_type_idx = None
+                molecule_id_idx = None
 
                 for i, col in enumerate(header):
                     if col == "protein_id" or col == "uniprot_id":
@@ -535,6 +611,10 @@ class PMolDataPreparer:
                         affinity_idx = i
                     elif col == "source":
                         source_idx = i
+                    elif col in ("interaction_type",):
+                        interaction_type_idx = i
+                    elif col in ("molecule_id", "molecule_chembl_id"):
+                        molecule_id_idx = i
 
                 # Check if this is a molecule interaction file (must have smiles)
                 if smiles_idx is None:
@@ -580,7 +660,27 @@ class PMolDataPreparer:
                     if source_idx is not None and len(parts) > source_idx:
                         source = parts[source_idx]
 
+                    # Get interaction_type if available
+                    interaction_type = 3
+                    if interaction_type_idx is not None and len(parts) > interaction_type_idx:
+                        try:
+                            interaction_type = int(parts[interaction_type_idx])
+                        except ValueError:
+                            pass
+
+                    # Get molecule_id if available
+                    molecule_id = None
+                    if molecule_id_idx is not None and len(parts) > molecule_id_idx:
+                        molecule_id = parts[molecule_id_idx] or None
+
+                    # Override interaction_type from mechanism data if available
+                    if molecule_id and molecule_id in self._mechanisms:
+                        interaction_type = self.infer_interaction_type(
+                            None, self._mechanisms[molecule_id]
+                        )
+
                     if label >= 0.5:  # Positive interaction
+</thinking>
                         # Validate sequences
                         if not self._is_valid_protein(protein_seq):
                             continue
@@ -604,6 +704,8 @@ class PMolDataPreparer:
                                 label=1,
                                 affinity=affinity,
                                 source=source,
+                                interaction_type=interaction_type,
+                                molecule_id=molecule_id,
                             )
                             self.interactions.append(interaction)
                             self.protein_mol_pairs.add(pair_key)
@@ -665,6 +767,9 @@ class PMolDataPreparer:
                                     sequence=protein_seq,
                                 )
 
+                            mol_id = entry.get("molecule_chembl_id") or entry.get("molecule_id")
+                            mechanism = self._mechanisms.get(mol_id) if mol_id else None
+                            itype = self.infer_interaction_type(activity_type, mechanism)
                             pair_key = (protein_seq, smiles)
                             if pair_key not in self.protein_mol_pairs:
                                 interaction = InteractionPair(
@@ -675,6 +780,8 @@ class PMolDataPreparer:
                                     affinity=affinity,
                                     source="ChEMBL",
                                     activity_type=activity_type,
+                                    interaction_type=itype,
+                                    molecule_id=mol_id,
                                 )
                                 self.interactions.append(interaction)
                                 self.protein_mol_pairs.add(pair_key)
@@ -919,15 +1026,15 @@ class PMolDataPreparer:
         # Save as pickle for faster loading
         pickle_data = {
             "train": [
-                (p.protein_id, p.protein_seq, p.smiles, p.label, p.affinity)
+                (p.protein_id, p.protein_seq, p.smiles, p.label, p.affinity, p.interaction_type)
                 for p in split.train_pairs
             ],
             "val": [
-                (p.protein_id, p.protein_seq, p.smiles, p.label, p.affinity)
+                (p.protein_id, p.protein_seq, p.smiles, p.label, p.affinity, p.interaction_type)
                 for p in split.val_pairs
             ],
             "test": [
-                (p.protein_id, p.protein_seq, p.smiles, p.label, p.affinity)
+                (p.protein_id, p.protein_seq, p.smiles, p.label, p.affinity, p.interaction_type)
                 for p in split.test_pairs
             ],
             "proteins": proteins_json,
@@ -947,12 +1054,12 @@ class PMolDataPreparer:
     def _save_pairs_tsv(self, filepath: Path, pairs: List[InteractionPair]) -> None:
         """Save interaction pairs to TSV file"""
         with open(filepath, "w") as f:
-            f.write("protein_id\tprotein_seq\tsmiles\tlabel\taffinity\tsource\n")
+            f.write("protein_id\tprotein_seq\tsmiles\tlabel\taffinity\tinteraction_type\tsource\n")
 
             for pair in pairs:
                 f.write(
                     f"{pair.protein_id}\t{pair.protein_seq}\t{pair.smiles}\t"
-                    f"{pair.label}\t{pair.affinity:.4f}\t{pair.source}\n"
+                    f"{pair.label}\t{pair.affinity:.4f}\t{pair.interaction_type}\t{pair.source}\n"
                 )
 
     def prepare(self) -> Dict[str, Any]:
@@ -964,6 +1071,7 @@ class PMolDataPreparer:
         # Load data
         self.load_proteins()
         self.load_molecules()
+        self._mechanisms = self.load_mechanisms()
         self.load_interactions()
 
         # Check if we have enough data
@@ -1027,6 +1135,15 @@ class PMolDataPreparer:
             logger.info(
                 f"Affinity range: {affinity_stats.get('min', 0):.2f}-{affinity_stats.get('max', 0):.2f}"
             )
+
+        # Interaction type distribution
+        type_counts: Dict[int, int] = {k: 0 for k in INTERACTION_TYPE_LABELS}
+        for pair in self.interactions:
+            type_counts[pair.interaction_type] = type_counts.get(pair.interaction_type, 0) + 1
+        logger.info("Interaction type distribution:")
+        for type_idx, label in INTERACTION_TYPE_LABELS.items():
+            logger.info(f"  - {label} ({type_idx}): {type_counts.get(type_idx, 0):,}")
+
         logger.info(f"Output directory: {self.output_dir}")
         logger.info("=" * 60)
 

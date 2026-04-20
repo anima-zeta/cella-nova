@@ -45,6 +45,7 @@ CHEMBL_BASE_URL = "https://www.ebi.ac.uk/chembl/api/data"
 CHEMBL_MOLECULE_URL = f"{CHEMBL_BASE_URL}/molecule.json"
 CHEMBL_ACTIVITY_URL = f"{CHEMBL_BASE_URL}/activity.json"
 CHEMBL_TARGET_URL = f"{CHEMBL_BASE_URL}/target.json"
+CHEMBL_MECHANISM_URL = "https://www.ebi.ac.uk/chembl/api/rest/mechanism.json"
 
 # PubChem
 PUBCHEM_BASE_URL = "https://pubchem.ncbi.nlm.nih.gov/rest/pug"
@@ -371,6 +372,59 @@ def fetch_target_info(target_ids: List[str]) -> Dict[str, Dict]:
     return targets
 
 
+def fetch_mechanism_data(molecule_ids: List[str]) -> Dict[str, str]:
+    """
+    Fetch mechanism-of-action (action_type) for molecules from ChEMBL.
+
+    Hits the /mechanism/ endpoint in batches of 50. When a molecule has
+    multiple mechanisms (different targets), the first returned is used.
+
+    Args:
+        molecule_ids: List of ChEMBL molecule IDs
+
+    Returns:
+        Dict mapping molecule_chembl_id -> action_type string
+        e.g. {"CHEMBL324340": "INHIBITOR", "CHEMBL109600": "ANTAGONIST"}
+    """
+    print(f"\nFetching mechanism-of-action for {len(molecule_ids):,} molecules...")
+
+    result: Dict[str, str] = {}
+    batch_size = 50
+
+    for i in tqdm(range(0, len(molecule_ids), batch_size), desc="Fetching mechanisms"):
+        batch = molecule_ids[i : i + batch_size]
+        batch_str = ",".join(batch)
+
+        params = {
+            "molecule_chembl_id__in": batch_str,
+            "limit": batch_size,
+        }
+
+        try:
+            response = requests.get(CHEMBL_MECHANISM_URL, params=params, timeout=60)
+            response.raise_for_status()
+            data = response.json()
+
+            for mechanism in data.get("mechanisms", []):
+                mol_id = mechanism.get("molecule_chembl_id")
+                action_type = mechanism.get("action_type")
+
+                if not mol_id or not action_type:
+                    continue
+
+                if mol_id not in result:
+                    result[mol_id] = action_type
+
+            time.sleep(0.2)
+
+        except requests.RequestException as e:
+            print(f"\n⚠️ Warning: {e}")
+            continue
+
+    print(f"✓ Retrieved mechanisms for {len(result):,} molecules")
+    return result
+
+
 def fetch_chembl_by_ids(chembl_ids: List[str]) -> List[Dict]:
     """
     Fetch specific molecules by ChEMBL IDs
@@ -693,6 +747,12 @@ Sources:
     )
 
     parser.add_argument(
+        "--include-mechanisms",
+        action="store_true",
+        help="Also fetch mechanism-of-action data from ChEMBL (requires --include-activities)",
+    )
+
+    parser.add_argument(
         "--max-activities",
         type=int,
         default=50000,
@@ -794,6 +854,14 @@ Sources:
         activities if activities else None,
         targets if targets else None,
     )
+
+    molecule_ids = list({a["molecule_chembl_id"] for a in activities if a.get("molecule_chembl_id")})
+    if args.include_mechanisms and molecule_ids:
+        mechanisms = fetch_mechanism_data(molecule_ids)
+        mechanisms_file = output_dir / "mechanisms.json"
+        with open(mechanisms_file, "w") as f:
+            json.dump(mechanisms, f, indent=2)
+        print(f"\n✓ Saved mechanisms to: {mechanisms_file}")
 
     # Save metadata
     save_metadata(

@@ -1,11 +1,14 @@
 """
 Cella Nova Download Module
 
-This module contains scripts for downloading biological data from various sources:
-- download_pro.py: Protein sequences from UniProt and STRING
-- download_dna.py: DNA sequences and motifs from JASPAR
-- download_rna.py: RNA sequences and motifs from ATtRACT
-- download_mol.py: Small molecules from ChEMBL and PubChem
+This module contains scripts for downloading biological data for
+protein-small molecule (P2M) interaction prediction.
+
+Scripts:
+    download_pro.py:            Protein sequences from UniProt
+    download_mol.py:            Small molecules and bioactivity data from ChEMBL
+    build_p2m_interactions.py:  Build protein-molecule interaction pairs
+    download_boltz_features.py: Pre-compute Boltz-2 structural features
 """
 
 from pathlib import Path

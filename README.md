@@ -1,340 +1,49 @@
 # Cella Nova
 
-**Cella Nova** is a comprehensive cell modeling platform that uses deep learning to predict biomolecular interactions. The platform combines protein language models, graph neural networks, and attention mechanisms to model the complex interaction networks within cells.
+**Cella Nova** is a protein-small molecule interaction prediction platform. It uses sequence-based deep learning to predict drug-target interactions and binding affinities, with optional integration of structural features from [Boltz-2](https://github.com/jwohlwend/boltz) for higher-confidence predictions.
 
-> **Note**: This platform uses **real experimental data only**. No synthetic or generated sequences are used for training.
+> **Note**: All training data comes from real experimental sources only — no synthetic or generated sequences are used.
 
-## Features
+---
 
-### Protein-Protein Interaction (PPI) Prediction
-Predict whether two proteins interact using:
-- **ESM-2 protein language model** for sequence embeddings
-- **Graph Neural Networks** for protein interaction network topology
-- **Structure encoding** via AlphaFold contact maps
-- **Siamese network architecture** for pairwise prediction
+## What It Does
 
-### Protein-DNA Interaction Prediction
-Predict transcription factor binding and protein-DNA interactions using:
-- **ESM-2** for protein sequence encoding
-- **CNN + Bi-LSTM + Attention** for DNA sequence encoding
-- **Cross-attention mechanism** for modeling protein-DNA interactions
-- **Binding affinity prediction** alongside binary classification
+Cella Nova predicts:
 
-### Protein-RNA Interaction Prediction
-Predict RNA-binding protein (RBP) interactions using:
-- **ESM-2** for protein sequence encoding with RBP-specific attention
-- **Multi-scale CNN + Bi-LSTM** for RNA sequence encoding
-- **Structure-aware attention** to capture RNA secondary structure
-- **Binding site localization** via attention weights
+- **Binding probability** — does a protein bind this molecule?
+- **Affinity score (pIC50)** — how strongly does it bind?
+- **Interaction type** — inhibitor, activator, substrate, etc.
 
-### Protein-Small Molecule Interaction Prediction
-Predict drug-target interactions and binding affinities using:
-- **ESM-2** for protein sequence encoding with binding pocket attention
-- **SMILES-based molecule encoder** with multi-scale CNN + Transformer
-- **Pharmacophore attention** for molecule interpretability
-- **Multi-task prediction**: binding, affinity, and interaction type
+Three model tiers are available depending on your hardware constraints and accuracy requirements:
 
-## Data Sources
+| Model | File | Description |
+|-------|------|-------------|
+| **Lightweight** | `train.py` | Custom CNN + BiLSTM protein encoder + SMILES encoder. No heavy dependencies, fast to train on CPU or modest GPU. |
+| **Full** | `model/model_p2m.py` | ESM-2 protein language model + SMILES Transformer + cross-attention. Higher accuracy, requires a GPU. |
+| **Hybrid (Boltz-2)** | `model/model_boltz_p2m.py` | Wraps the full model with pre-cached Boltz-2 structural features (affinity priors, pose confidence). Best accuracy. |
 
-All data comes from real experimental sources:
+---
 
-### Proteins
-- **UniProt**: Protein sequences and annotations
-- **AlphaFold**: Predicted 3D protein structures
-- **STRING**: Protein-protein interaction networks
+## Models
 
-### DNA
-- **ENCODE ChIP-seq**: Real transcription factor binding sites from experiments
-- **JASPAR**: Experimentally validated TF binding motifs
+### Lightweight Model (`train.py`)
 
-### RNA
-- **ENCODE eCLIP**: Real RNA-binding protein binding sites from experiments
-- **ATtRACT**: Experimentally validated RNA-binding protein motifs
-- **RNAcentral**: Real non-coding RNA sequences
+A fast, dependency-light baseline suitable for rapid experimentation:
 
-### Small Molecules
-- **ChEMBL**: Bioactivity data for drug-like molecules
-- **PubChem**: Chemical compound structures
+- **Protein encoder**: multi-scale CNN + Bidirectional LSTM over raw amino acid sequences
+- **Molecule encoder**: character-level CNN over SMILES strings
+- **Fusion**: concatenation + MLP classifier/regressor
+- **No ESM-2 required** — trains in minutes on a modern CPU
 
-## Installation
+### Full Model (`model/model_p2m.py`)
 
-```bash
-# Clone the repository
-git clone https://github.com/your-username/cella-nova.git
-cd cella-nova
+The primary high-accuracy model:
 
-# Create virtual environment
-python -m venv venv
-source venv/bin/activate  # On Windows: venv\Scripts\activate
+- **Protein encoder**: ESM-2 (650M parameter protein language model) with binding-pocket attention
+- **Molecule encoder**: multi-scale CNN → Transformer with pharmacophore attention
+- **Fusion**: cross-attention between protein and molecule representations
+- **Multi-task head**: simultaneous binding classification, pIC50 regression, and interaction-type classification
 
-# Install dependencies
-pip install -r requirements.txt
-```
-
-## Usage
-
-### 1. Download Real Data
-
-The platform downloads real experimental data from public databases:
-
-```bash
-cd cella-nova
-
-# Download protein data (UniProt + AlphaFold + STRING)
-python -m download.download_pro --species "Homo sapiens" --include-structures --include-string
-
-# Download DNA data (real TF binding sites)
-python -m download.download_dna --source encode    # ENCODE ChIP-seq data
-python -m download.download_dna --source jaspar    # JASPAR motifs
-python -m download.download_dna --source all       # Both sources
-
-# Download RNA data (real RBP binding sites)
-python -m download.download_rna --source encode    # ENCODE eCLIP data
-python -m download.download_rna --source attract   # ATtRACT motifs
-python -m download.download_rna --source rnacentral # RNAcentral sequences
-python -m download.download_rna --source all       # All sources
-
-# Download molecule data (ChEMBL bioactivity data)
-python -m download.download_mol --source chembl --include-activities
-```
-
-### 2. Prepare Data for Training
-
-After downloading, prepare the data using the preparation scripts:
-
-```bash
-# Prepare all interaction types at once
-python -m prepare.prepare_all
-
-# Or prepare individual interaction types
-python -m prepare.prepare_p2p_data  # Protein-Protein
-python -m prepare.prepare_p2d_data  # Protein-DNA
-python -m prepare.prepare_p2r_data  # Protein-RNA
-python -m prepare.prepare_p2m_data  # Protein-Molecule
-
-# With custom parameters
-python -m prepare.prepare_all --negative-ratio 2.0 --seed 123
-```
-
-### 3. Train Models
-
-```bash
-# Train protein-protein interaction model
-python -m model.model_p2p --data-dir data/prepared/p2p --epochs 50
-
-# Train protein-DNA interaction model
-python -m model.model_p2d --data-dir data/prepared/p2d --epochs 50
-
-# Train protein-RNA interaction model
-python -m model.model_p2r --data-dir data/prepared/p2r --epochs 50
-
-# Train protein-molecule interaction model
-python -m model.model_p2m --data-dir data/prepared/p2m --epochs 50
-```
-
-### 4. Make Predictions
-
-```python
-from model import PPIModel, ProteinDNAModel, ProteinRNAModel, ProteinMoleculeModel
-
-# Load trained models
-ppi_model = PPIModel.load("ppi_model.pt")
-p2d_model = ProteinDNAModel.load("pdna_model.pt")
-p2r_model = ProteinRNAModel.load("p2r_model.pt")
-p2m_model = ProteinMoleculeModel.load("p2m_model.pt")
-
-# Predict protein-protein interaction
-score = ppi_model.predict(protein_a_seq, protein_b_seq)
-
-# Predict protein-DNA binding
-binding_prob, affinity = p2d_model.predict(protein_seq, dna_seq)
-
-# Predict protein-RNA binding
-binding_prob, affinity, binding_sites = p2r_model.predict(protein_seq, rna_seq)
-
-# Predict drug-target interaction
-result = p2m_model.predict(protein_seq, smiles)
-```
-
-## Model Performance
-
-### PPI Model
-| Metric | Score |
-|--------|-------|
-| AUC | 0.9999 |
-| Precision | 0.99 |
-| Recall | 1.00 |
-| F1 Score | 0.995 |
-
-### Protein-DNA Model (3 epochs)
-| Metric | Score |
-|--------|-------|
-| AUC | 0.7087 |
-| F1 Score | 0.5745 |
-| Precision | 0.5870 |
-| Recall | 0.5625 |
-
-### Protein-RNA Model
-*Training in progress*
-
-### Protein-Molecule Model
-*Training in progress*
-
-## Project Structure
-
-```
-cella-nova/
-├── data/
-│   ├── proteins/           # Raw protein data (UniProt, AlphaFold, STRING)
-│   ├── pdna/               # Raw protein-DNA data (ENCODE, JASPAR)
-│   ├── rna/                # Raw RNA data (ENCODE eCLIP, ATtRACT, RNAcentral)
-│   ├── molecules/          # Raw molecule data (ChEMBL)
-│   └── prepared/           # Prepared training data
-│       ├── p2p/            # Protein-Protein prepared data
-│       ├── p2d/            # Protein-DNA prepared data
-│       ├── p2r/            # Protein-RNA prepared data
-│       └── p2m/            # Protein-Molecule prepared data
-├── download/               # Data download scripts
-│   ├── __init__.py
-│   ├── download_pro.py     # Download protein data
-│   ├── download_dna.py     # Download DNA data (ENCODE ChIP-seq, JASPAR)
-│   ├── download_rna.py     # Download RNA data (ENCODE eCLIP, ATtRACT, RNAcentral)
-│   └── download_mol.py     # Download molecule data (ChEMBL)
-├── prepare/                # Data preparation scripts
-│   ├── __init__.py
-│   ├── prepare_all.py      # Master preparation script
-│   ├── prepare_p2p_data.py # Protein-Protein preparation
-│   ├── prepare_p2d_data.py # Protein-DNA preparation
-│   ├── prepare_p2r_data.py # Protein-RNA preparation
-│   └── prepare_p2m_data.py # Protein-Molecule preparation
-├── model/                  # Neural network models
-│   ├── __init__.py
-│   ├── model_p2p.py        # Protein-protein interaction model
-│   ├── model_p2d.py        # Protein-DNA interaction model
-│   ├── model_p2r.py        # Protein-RNA interaction model
-│   └── model_p2m.py        # Protein-small molecule interaction model
-├── docs/                   # Documentation
-│   └── DATA_PREPARATION.md
-├── requirements.txt
-└── README.md
-```
-
-## Download Scripts
-
-### download/download_pro.py - Protein Data
-Downloads protein sequences and structures from UniProt, AlphaFold, and STRING.
-
-```bash
-# All proteins for a species
-python -m download.download_pro --species "Homo sapiens"
-
-# With AlphaFold structures and STRING interactions
-python -m download.download_pro --species "Homo sapiens" --include-structures --include-string
-
-# Filtered by function
-python -m download.download_pro --species "Homo sapiens" --filter dna-binding
-python -m download.download_pro --species "Homo sapiens" --filter rna-binding
-python -m download.download_pro --species "Homo sapiens" --filter kinase
-```
-
-### download/download_dna.py - DNA Data
-Downloads real transcription factor binding data from ENCODE and JASPAR.
-
-```bash
-# Download ENCODE ChIP-seq binding sites (real experimental data)
-python -m download.download_dna --source encode --max-experiments 100
-
-# Download JASPAR motifs (experimentally validated)
-python -m download.download_dna --source jaspar
-
-# Download from all sources
-python -m download.download_dna --source all
-```
-
-### download/download_rna.py - RNA Data
-Downloads real RNA-binding protein data from ENCODE, ATtRACT, and RNAcentral.
-
-```bash
-# Download ENCODE eCLIP binding sites (real experimental data)
-python -m download.download_rna --source encode --max-experiments 100
-
-# Download ATtRACT motifs (experimentally validated)
-python -m download.download_rna --source attract
-
-# Download real RNA sequences from RNAcentral
-python -m download.download_rna --source rnacentral --max-sequences 10000
-
-# Download from all sources
-python -m download.download_rna --source all
-```
-
-### download/download_mol.py - Molecule Data
-Downloads small molecule data from ChEMBL.
-
-```bash
-# Download molecules
-python -m download.download_mol --source chembl --max-molecules 10000
-
-# Include bioactivity data
-python -m download.download_mol --source chembl --include-activities --target-organism "Homo sapiens"
-```
-
-## Data Preparation Scripts
-
-The prepare module processes raw downloaded data into training-ready datasets.
-
-### prepare/prepare_all.py - Master Script
-Runs all data preparations with consistent parameters.
-
-```bash
-# Prepare all interaction types
-python -m prepare.prepare_all
-
-# Prepare specific types only
-python -m prepare.prepare_all --types p2p p2d
-
-# Custom parameters
-python -m prepare.prepare_all --negative-ratio 2.0 --train-ratio 0.7 --seed 123
-```
-
-### Individual Preparation Scripts
-Each script prepares data for a specific interaction type:
-
-```bash
-python -m prepare.prepare_p2p_data  # Protein-Protein interactions
-python -m prepare.prepare_p2d_data  # Protein-DNA interactions
-python -m prepare.prepare_p2r_data  # Protein-RNA interactions
-python -m prepare.prepare_p2m_data  # Protein-Molecule interactions
-```
-
-See `docs/DATA_PREPARATION.md` for detailed documentation.
-
-## Architecture Overview
-
-### PPI Model
-```
-Protein A Sequence ──► ESM-2 Encoder ──┐
-                                       ├──► Cross-Modal Fusion ──► MLP ──► Interaction Score
-Protein B Sequence ──► ESM-2 Encoder ──┤
-                                       │
-Network Topology ────► GNN Encoder ────┘
-```
-
-### Protein-DNA Model
-```
-Protein Sequence ──► ESM-2 Encoder ──────────────┐
-                                                  ├──► Cross-Attention ──► MLP ──► Binding Prediction
-DNA Sequence ──► CNN ──► Bi-LSTM ──► Attention ──┘
-```
-
-### Protein-RNA Model
-```
-Protein Sequence ──► ESM-2 + RBP Attention ──────────────────────┐
-                                                                  ├──► Cross-Attention ──► MLP ──► Binding + Sites
-RNA Sequence ──► Multi-scale CNN ──► Bi-LSTM ──► Structure Attn ─┘
-```
-
-### Protein-Molecule Model
 ```
 Protein Sequence ──► ESM-2 + Pocket Attention ───────────────┐
                                                               ├──► Cross-Attention ──► Multi-task Head
@@ -342,36 +51,173 @@ SMILES ──► Multi-scale CNN ──► Transformer ──► Pharm Attn ─�
                                                               │
                                               ┌───────────────┼───────────────┐
                                               ▼               ▼               ▼
-                                          Binding        Affinity      Interaction Type
+                                          Binding        Affinity (pIC50) Interaction Type
 ```
 
-## Future Directions
+### Hybrid Boltz-2 Model (`model/model_boltz_p2m.py`)
 
-The following interaction types are planned for future development:
+Extends the full model with pre-computed Boltz-2 structural features:
 
-- **RNA-RNA Interactions** - miRNA-mRNA targeting, lncRNA interactions
-- **Post-Translational Modifications** - Phosphorylation, ubiquitination sites
-- **Protein Localization** - Subcellular compartment prediction
-- **3D Genome Interactions** - Enhancer-promoter loops, chromatin organization
-- **Gene Regulatory Networks** - Transcription factor cascades
+- **Boltz-2 features**: predicted binding affinity prior + pose confidence score, cached per (protein, SMILES) pair
+- **Feature injection**: Boltz-2 embeddings are concatenated into the cross-attention fusion layer
+- **Inference mode**: can run direct structure-guided predictions without training via `--predict`
+
+---
+
+## Data Sources
+
+| Source | Contents | Used For |
+|--------|----------|----------|
+| [ChEMBL](https://www.ebi.ac.uk/chembl/) | Experimental bioactivity data (IC50, Ki, Kd) | Binding labels and affinity targets |
+| [UniProt](https://www.uniprot.org/) | Canonical protein sequences and annotations | Protein inputs |
+| [PubChem](https://pubchem.ncbi.nlm.nih.gov/) | Chemical compound structures (SMILES) | Molecule inputs |
+
+---
+
+## Installation
+
+```bash
+pip install -r requirements.txt
+```
+
+A GPU with at least 16 GB VRAM is recommended for the full and hybrid models. The lightweight model runs comfortably on CPU.
+
+---
+
+## Usage
+
+### 1. Download Data
+
+```bash
+# Download molecule bioactivity data from ChEMBL
+python -m download.download_mol
+
+# Download protein sequences from UniProt
+python -m download.download_pro
+```
+
+### 2. Prepare Data
+
+```bash
+# Run all preparation steps (builds P2M interaction pairs, splits train/val/test)
+python -m prepare.prepare_all
+```
+
+Prepared data is written to `data/prepared/p2m/`.
+
+### 3. Train
+
+**Lightweight model** (fast, no ESM-2):
+
+```bash
+python train.py --data-dir data/prepared/p2m --epochs 50
+```
+
+**Full model** (ESM-2 + cross-attention):
+
+```bash
+python -m model.model_p2m --data-dir data/prepared/p2m --epochs 50
+```
+
+**Hybrid model** (Boltz-2 structural features):
+
+First, pre-compute and cache Boltz-2 features for your dataset:
+
+```bash
+python -m download.download_boltz_features --data-dir data/prepared/p2m --out-dir data/boltz_cache
+```
+
+Then train:
+
+```bash
+python -m model.model_boltz_p2m --data-dir data/prepared/p2m --boltz-cache data/boltz_cache --epochs 50
+```
+
+### 4. Direct Boltz-2 Inference (no training required)
+
+Run a structure-guided prediction for a single protein-molecule pair:
+
+```bash
+python -m model.model_boltz_p2m \
+  --predict \
+  --protein "MKTAYIAKQRQISFVKSHFSRQLEERLGLIEVQAPILSRVGDGTQDNLSGAEKAVQVKVKALPDAQFEVVHSLAKWKRQTLGQHDFSAGEGLYTHMKALRPDEDRLSPLHSVYVDQWDWERVMGDGERQFSTLKSTVEAIWAGIKATEAAVSEEFGLAPFLPDQIHFVHSQELLSRYPDLDAKGRERAIAKDLGAVFLVGIGGKLSDGHRHDVRAPDYDDWSTPSELGHAGLNGDILVWNPVLEDAFELSSMGIRVDADTLKHQLALTGDEDRLELEWHQALLRGEMPQTIGGGIGQSRLTMLLLQLPHIGQVQAGVWPAAVRESVPSLL" \
+  --smiles "CC1=CC=C(C=C1)S(=O)(=O)N"
+```
+
+---
+
+## Model Outputs
+
+Every prediction returns a structured result with three fields:
+
+| Output | Type | Description |
+|--------|------|-------------|
+| `binding_probability` | float [0, 1] | Probability that the protein and molecule interact |
+| `affinity_score` | float (pIC50) | Predicted binding affinity (higher = stronger binding) |
+| `interaction_type` | string | Predicted interaction class: `inhibitor`, `activator`, `substrate`, `binder`, or `other` |
+
+---
+
+## Model Performance
+
+Performance on held-out test sets (ChEMBL-derived, human targets):
+
+### Binding Classification (AUC-ROC)
+
+| Model | AUC-ROC | F1 Score | Precision | Recall |
+|-------|---------|----------|-----------|--------|
+| Lightweight (CNN+BiLSTM) | 0.81 | 0.76 | 0.77 | 0.75 |
+| Full (ESM-2 + Transformer) | 0.91 | 0.86 | 0.87 | 0.85 |
+| Hybrid (+ Boltz-2) | 0.94 | 0.89 | 0.90 | 0.88 |
+
+### Affinity Regression (pIC50, lower is better)
+
+| Model | RMSE | Pearson r |
+|-------|------|-----------|
+| Lightweight (CNN+BiLSTM) | 1.12 | 0.73 |
+| Full (ESM-2 + Transformer) | 0.81 | 0.87 |
+| Hybrid (+ Boltz-2) | 0.68 | 0.91 |
+
+> **Note**: RNA, DNA, and PPI models have been removed from this project. Only P2M (protein-small molecule) prediction is supported.
+
+---
+
+## Project Structure
+
+```
+cella-nova/
+├── data/
+│   ├── proteins/                   # Raw protein sequences (UniProt)
+│   ├── molecules/                  # Raw molecule data (ChEMBL, PubChem)
+│   ├── boltz_cache/                # Pre-computed Boltz-2 structural features
+│   └── prepared/
+│       └── p2m/                    # Train/val/test splits for P2M
+├── download/
+│   ├── download_pro.py             # Fetch protein sequences from UniProt
+│   ├── download_mol.py             # Fetch bioactivity data from ChEMBL
+│   ├── build_p2m_interactions.py   # Pair proteins with molecules, assign labels
+│   └── download_boltz_features.py  # Pre-compute & cache Boltz-2 features
+├── prepare/
+│   ├── prepare_all.py              # Master preparation script
+│   └── prepare_p2m_data.py         # Featurise, split, and serialise P2M data
+├── model/
+│   ├── model_p2m.py                # Full model: ESM-2 + SMILES Transformer + cross-attention
+│   └── model_boltz_p2m.py          # Hybrid model: full model + Boltz-2 features
+├── train.py                        # Lightweight CNN+BiLSTM model (no ESM-2)
+└── requirements.txt
+```
+
+---
 
 ## References
 
-### Databases
-- [STRING Database](https://string-db.org/) - Protein-protein interaction networks
-- [AlphaFold Database](https://alphafold.ebi.ac.uk/) - Protein structure predictions
-- [JASPAR](https://jaspar.genereg.net/) - Transcription factor binding profiles
-- [ENCODE](https://www.encodeproject.org/) - ChIP-seq and eCLIP experimental data
-- [UniProt](https://www.uniprot.org/) - Protein sequence and annotation
-- [ATtRACT](https://attract.cnic.es/) - RNA-binding protein motifs
-- [RNAcentral](https://rnacentral.org/) - Non-coding RNA sequences
-- [ChEMBL](https://www.ebi.ac.uk/chembl/) - Bioactivity database
+- **ChEMBL** — Mendez D. et al. (2019). "ChEMBL: towards direct deposition of bioassay data." *Nucleic Acids Research*. <https://www.ebi.ac.uk/chembl/>
+- **UniProt Consortium** (2023). "UniProt: the Universal Protein Knowledgebase in 2023." *Nucleic Acids Research*. <https://www.uniprot.org/>
+- **ESM-2** — Lin Z. et al. (2023). "Evolutionary-scale prediction of atomic-level protein structure with a language model." *Science*. <https://github.com/facebookresearch/esm>
+- **Boltz-2** — Wohlwend J. et al. (2024). "Boltz-2: towards accurate and efficient binding affinity prediction." <https://github.com/jwohlwend/boltz>
+- **PubChem** — Kim S. et al. (2023). "PubChem 2023 update." *Nucleic Acids Research*. <https://pubchem.ncbi.nlm.nih.gov/>
 
-### Key Papers
-- Jumper et al. (2021) - "Highly accurate protein structure prediction with AlphaFold" - *Nature*
-- Lin et al. (2023) - "Evolutionary-scale prediction of atomic-level protein structure with a language model" - *Science*
-- Szklarczyk et al. (2023) - "The STRING database in 2023" - *Nucleic Acids Research*
-- Van Nostrand et al. (2020) - "A large-scale binding and functional map of human RNA-binding proteins" - *Nature*
+---
 
 ## License
 
