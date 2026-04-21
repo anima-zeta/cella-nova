@@ -1131,8 +1131,6 @@ Data files expected:
 
     # Resolve --resume path
     resume_path = save_path.with_suffix(".latest.pt")
-    if not resume_path.exists():
-        print(f"  ⚠  Resume file not found: {resume_path}")
 
     history = train_model(
         model=model,

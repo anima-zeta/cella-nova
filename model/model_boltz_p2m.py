@@ -652,7 +652,7 @@ def train_hybrid_epoch(
     correct = 0
     total = 0
 
-    for batch in tqdm(dataloader, desc="Training", leave=False):
+    for batch_idx, batch in enumerate(tqdm(dataloader, desc="Training", leave=False)):
         labels = batch["label"].to(device)
         smiles = batch["smiles"].to(device)
         affinity = batch["affinity"].to(device)
@@ -694,6 +694,11 @@ def train_hybrid_epoch(
         preds = (torch.sigmoid(output["interaction_logits"]) > 0.5).float()
         correct += (preds == labels).sum().item()
         total += labels.size(0)
+
+        # Periodically flush the MPS allocator to prevent fragmentation buildup
+        if hasattr(torch, "mps") and torch.backends.mps.is_available():
+            if batch_idx % 100 == 0:
+                torch.mps.empty_cache()
 
     return {
         "loss": total_loss / max(len(dataloader), 1),
@@ -796,6 +801,32 @@ def evaluate_hybrid(
     }
 
 
+def _save_hybrid_checkpoint(
+    path: Path,
+    model: "HybridP2MModel",
+    optimizer,
+    scheduler,
+    epoch: int,
+    best_auc: float,
+    patience_counter: int,
+    history: Dict,
+) -> None:
+    """Save a full resumable hybrid checkpoint."""
+    torch.save(
+        {
+            "epoch": epoch,
+            "model_state_dict": model.state_dict(),
+            "optimizer_state_dict": optimizer.state_dict(),
+            "scheduler_state_dict": scheduler.state_dict(),
+            "best_auc": best_auc,
+            "patience_counter": patience_counter,
+            "hidden_dim": model.hidden_dim,
+            "history": history,
+        },
+        path,
+    )
+
+
 def train_hybrid_model(
     model: HybridP2MModel,
     train_loader: DataLoader,
@@ -805,12 +836,15 @@ def train_hybrid_model(
     device: torch.device,
     save_path: Path,
     patience: int = 10,
+    resume_path: Path = None,
 ) -> Dict[str, List[float]]:
     """
     Full training loop with early stopping for the ``HybridP2MModel``.
 
     Uses AdamW with a ReduceLROnPlateau scheduler (monitors validation AUC).
-    The best checkpoint (by AUC) is saved to ``save_path``.
+    Two checkpoints are written:
+      - ``save_path``         — best model by validation AUC
+      - ``save_path.latest``  — most recent epoch (always, for reliable resume)
 
     Parameters
     ----------
@@ -823,6 +857,9 @@ def train_hybrid_model(
         Where to write the best model checkpoint (.pt).
     patience : int
         Number of epochs without improvement before early stopping.
+    resume_path : Path, optional
+        Checkpoint to resume from (restores model, optimizer, scheduler,
+        history, and epoch counter).
 
     Returns
     -------
@@ -848,12 +885,30 @@ def train_hybrid_model(
         "val_f1": [],
         "val_affinity_rmse": [],
     }
+    start_epoch = 0
+
+    # Restore from checkpoint if requested
+    if resume_path and Path(resume_path).exists():
+        print(f"\n  Resuming from checkpoint: {resume_path}")
+        ckpt = torch.load(resume_path, map_location=device, weights_only=False)
+        model.load_state_dict(ckpt["model_state_dict"])
+        optimizer.load_state_dict(ckpt["optimizer_state_dict"])
+        scheduler.load_state_dict(ckpt["scheduler_state_dict"])
+        best_auc        = ckpt.get("best_auc", 0.0)
+        patience_counter = ckpt.get("patience_counter", 0)
+        history         = ckpt.get("history", history)
+        start_epoch     = ckpt["epoch"] + 1
+        print(f"  Resumed at epoch {start_epoch + 1} | best AUC so far: {best_auc:.4f}")
+    elif resume_path:
+        print(f"  ⚠  Resume checkpoint not found at {resume_path} — starting fresh")
+
+    latest_path = Path(save_path).with_suffix(".latest.pt")
 
     print("\n" + "=" * 70)
     print("HYBRID P2M MODEL — TRAINING")
     print("=" * 70)
 
-    for epoch in range(epochs):
+    for epoch in range(start_epoch, epochs):
         print(f"\nEpoch {epoch + 1}/{epochs}")
 
         train_m = train_hybrid_epoch(model, train_loader, optimizer, device)
@@ -880,18 +935,18 @@ def train_hybrid_model(
         history["val_f1"].append(val_m["f1"])
         history["val_affinity_rmse"].append(val_m["affinity_rmse"])
 
+        # Always save latest checkpoint so training can be resumed at any point
+        _save_hybrid_checkpoint(
+            latest_path, model, optimizer, scheduler,
+            epoch, best_auc, patience_counter, history,
+        )
+
         if val_m["auc"] > best_auc:
             best_auc = val_m["auc"]
             patience_counter = 0
-            torch.save(
-                {
-                    "epoch": epoch,
-                    "model_state_dict": model.state_dict(),
-                    "best_auc": best_auc,
-                    "hidden_dim": model.hidden_dim,
-                    "history": history,
-                },
-                save_path,
+            _save_hybrid_checkpoint(
+                Path(save_path), model, optimizer, scheduler,
+                epoch, best_auc, patience_counter, history,
             )
             print(f"  ✓ Saved best model → {save_path} (AUC: {best_auc:.4f})")
         else:
@@ -950,6 +1005,26 @@ def main() -> None:
         type=str,
         default=None,
         help="Path to a pre-trained ProteinMoleculeModel .pt to use as the base model",
+    )
+    parser.add_argument(
+        "--resume",
+        type=str,
+        default=None,
+        help="Path to a hybrid checkpoint to resume from. "
+             "Use 'latest' to auto-load {checkpoint}.latest.pt.",
+    )
+    parser.add_argument(
+        "--cache-only",
+        action="store_true",
+        help="Only train on samples that have pre-computed Boltz-2 features "
+             "(skips all zero-feature pairs). Off by default.",
+    )
+    parser.add_argument(
+        "--esm-cache",
+        type=str,
+        default=None,
+        help="Path to pre-computed ESM-2 embedding cache (.pt) from precompute_esm.py. "
+             "Skips loading ESM-2 entirely and removes the main training bottleneck.",
     )
 
     parser.add_argument(
@@ -1055,17 +1130,17 @@ def main() -> None:
         sys.exit(1)
 
     # Build datasets from the pre-split files produced by prepare_p2m_data.py.
-    # cache_only=True in Phase 2: only train on pairs that have Boltz features.
-    phase2 = bool(args.base_checkpoint)
+    # Always train on all samples — zero vectors are used as fallback when
+    # Boltz-2 features are absent. Use --cache-only to restrict to cached pairs.
     train_dataset = BoltzEnhancedDataset(
         data_file=train_file,
         boltz_cache_dir=args.boltz_cache,
-        cache_only=phase2,
+        cache_only=args.cache_only,
     )
     val_dataset = BoltzEnhancedDataset(
         data_file=val_file,
         boltz_cache_dir=args.boltz_cache,
-        cache_only=phase2,
+        cache_only=args.cache_only,
     )
 
     if len(train_dataset) == 0:
@@ -1095,6 +1170,7 @@ def main() -> None:
         molecule_dim=512,
         hidden_dim=512,
         device=device,
+        esm_cache_path=args.esm_cache,
     ).to(device)
 
     if args.base_checkpoint:
@@ -1129,6 +1205,17 @@ def main() -> None:
 
     # Run training
     save_path = Path(args.checkpoint)
+    # Resolve --resume path
+    resume_path = None
+    if args.resume:
+        save_path = Path(args.checkpoint)
+        if args.resume == "latest":
+            resume_path = save_path.with_suffix(".latest.pt")
+        else:
+            resume_path = Path(args.resume)
+        if not resume_path.exists():
+            print(f"  ⚠  Resume file not found: {resume_path}")
+
     history = train_hybrid_model(
         model=model,
         train_loader=train_loader,
@@ -1136,8 +1223,9 @@ def main() -> None:
         epochs=args.epochs,
         lr=args.lr,
         device=device,
-        save_path=save_path,
+        save_path=Path(args.checkpoint),
         patience=args.patience,
+        resume_path=resume_path,
     )
 
     # Persist training history alongside the checkpoint
