@@ -1,6 +1,6 @@
 # Core dependencies
 torch>=2.0.0
-boltz[cuda]>=2.0.0
+boltz>=2.0.0
 pyyaml>=6.0
 torch-geometric>=2.3.0
 numpy>=1.24.0

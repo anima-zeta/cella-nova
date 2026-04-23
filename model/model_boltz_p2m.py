@@ -129,11 +129,13 @@ class BoltzP2MPredictor:
         cache_dir: str = "data/boltz_cache",
         use_msa_server: bool = True,
         boltz_bin: str = "boltz",
+        accelerator: str = "cpu",
     ) -> None:
         self.cache_dir = Path(cache_dir)
         self.cache_dir.mkdir(parents=True, exist_ok=True)
         self.use_msa_server = use_msa_server
         self.boltz_bin = boltz_bin
+        self.accelerator = accelerator
 
     # ------------------------------------------------------------------
     # Public API
@@ -210,7 +212,12 @@ class BoltzP2MPredictor:
     # ------------------------------------------------------------------
 
     def _build_yaml(self, protein_seq: str, smiles: str) -> str:
-        """Compose a Boltz-2 YAML input for one protein–ligand complex."""
+        """Compose a Boltz-2 YAML input for one protein–ligand complex.
+
+        Includes ``properties: affinity: binder: B`` so Boltz runs its
+        affinity head and writes ``affinity_{stem}.json`` alongside the
+        confidence JSON and .cif structure file.
+        """
         return (
             "version: 1\n"
             "sequences:\n"
@@ -220,6 +227,9 @@ class BoltzP2MPredictor:
             "  - ligand:\n"
             "      id: B\n"
             f"      smiles: {smiles}\n"
+            "properties:\n"
+            "  - affinity:\n"
+            "      binder: B\n"
         )
 
     def _run_boltz(self, protein_seq: str, smiles: str, key: str) -> Dict:
@@ -229,6 +239,16 @@ class BoltzP2MPredictor:
 
         Raises ``RuntimeError`` if Boltz-2 exits with a non-zero code.
         """
+        import os as _os
+        env = _os.environ.copy()
+
+        # On Apple Silicon (no CUDA), pass --accelerator gpu and set the MPS
+        # fallback env var so PyTorch Lightning auto-selects MPS and ops not
+        # yet ported to Metal fall back to CPU silently instead of crashing.
+        boltz_accelerator = self.accelerator
+        if self.accelerator == "gpu" and not torch.cuda.is_available():
+            env["PYTORCH_ENABLE_MPS_FALLBACK"] = "1"
+
         with tempfile.TemporaryDirectory(prefix="boltz_p2m_") as raw_tmp:
             tmpdir = Path(raw_tmp)
 
@@ -246,6 +266,7 @@ class BoltzP2MPredictor:
                 str(input_file),
                 "--out_dir", str(output_dir),
                 "--model", "boltz2",
+                "--accelerator", self.accelerator,
             ]
             if self.use_msa_server:
                 cmd.append("--use_msa_server")
@@ -255,6 +276,7 @@ class BoltzP2MPredictor:
                 capture_output=True,
                 text=True,
                 check=False,
+                env=env,
             )
             if proc.returncode != 0:
                 raise RuntimeError(
@@ -275,23 +297,27 @@ class BoltzP2MPredictor:
                 affinity_model_0.json
                 <stem>_model_0.cif
         """
-        # Locate the per-prediction subdirectory
-        pred_root = output_dir / "predictions"
-        pred_dirs = list(pred_root.glob("*")) if pred_root.exists() else []
+        # Boltz writes to out_dir/boltz_results_{stem}/predictions/{stem}/
+        # Locate the prediction subdirectory by searching from the output root.
+        pred_dirs = list(output_dir.rglob("predictions/*"))
+        # rglob returns files too; keep only directories
+        pred_dirs = [p for p in pred_dirs if p.is_dir()]
         pred_dir: Path = pred_dirs[0] if pred_dirs else output_dir
 
-        # Confidence JSON
+        # Boltz names files as confidence_{stem}_model_0.json and affinity_{stem}.json
+        # where stem = the YAML input file's base name (= our key hash).
+        # We resolve by glob so we don't need to reconstruct the stem.
         confidence_data: Dict = {}
-        conf_json = pred_dir / "confidence_model_0.json"
-        if conf_json.exists():
-            with open(conf_json) as fh:
+        conf_files = list(pred_dir.glob("confidence_*_model_0.json"))
+        if conf_files:
+            with open(conf_files[0]) as fh:
                 confidence_data = json.load(fh)
 
         # Affinity JSON
         affinity_data: Dict = {}
-        aff_json = pred_dir / "affinity_model_0.json"
-        if aff_json.exists():
-            with open(aff_json) as fh:
+        aff_files = list(pred_dir.glob("affinity_*.json"))
+        if aff_files:
+            with open(aff_files[0]) as fh:
                 affinity_data = json.load(fh)
 
         # Copy .cif structure into persistent cache
@@ -631,173 +657,174 @@ def collate_fn(batch: List[Dict]) -> Dict:
 # ---------------------------------------------------------------------------
 
 
-def train_hybrid_epoch(
-    model: HybridP2MModel,
+def train_distillation_epoch(
+    model: "ProteinMoleculeModel",
     dataloader: DataLoader,
     optimizer: torch.optim.Optimizer,
     device: torch.device,
+    distill_weight: float = 0.5,
 ) -> Dict[str, float]:
     """
-    Run one training epoch for the ``HybridP2MModel``.
+    One knowledge distillation training epoch.
 
-    Loss = BCE(interaction_logits, labels)
-           + 0.1 * MSE(predicted_affinity, true_affinity)  [positive pairs only]
+    The student (ProteinMoleculeModel) is trained on two signals simultaneously:
 
-    Returns
-    -------
-    dict with keys ``loss`` and ``accuracy``.
+    1. Experimental ground truth (always applied):
+         BCE(pred_binding, experimental_label)
+       + 0.1 * MSE(pred_affinity, experimental_affinity)   [positive pairs]
+       + 0.3 * CE(pred_interaction_type, itype_label)      [positive pairs]
+
+    2. Boltz-2 soft labels (only where cache data exists, ligand_iptm > 0):
+         distill_weight * BCE(sigmoid(pred_logit), boltz_binding_prob)
+       + distill_weight * 0.1 * MSE(pred_affinity, boltz_affinity)
+
+    At inference time, Boltz-2 is not needed — the student has internalised
+    its structural knowledge into its sequence-level weights.
     """
     model.train()
     total_loss = 0.0
     correct = 0
     total = 0
+    distill_count = 0  # batches where Boltz soft labels were applied
 
     for batch_idx, batch in enumerate(tqdm(dataloader, desc="Training", leave=False)):
-        labels = batch["label"].to(device)
-        smiles = batch["smiles"].to(device)
-        affinity = batch["affinity"].to(device)
-        boltz_feats = batch["boltz_features"].to(device)
+        labels    = batch["label"].to(device)
+        smiles    = batch["smiles"].to(device)
+        affinity  = batch["affinity"].to(device)
+        boltz_feats = batch["boltz_features"].to(device)  # [B, 4]
+
+        # Boltz soft labels — extracted from the feature vector
+        boltz_affinity     = boltz_feats[:, 0]   # affinity_pred_value (log IC50)
+        boltz_binding_prob = boltz_feats[:, 1]   # affinity_probability_binary
+        boltz_mask = boltz_feats[:, 2] > 0.0     # ligand_iptm > 0 = real prediction
 
         optimizer.zero_grad()
 
-        output = model(batch["protein_seq"], smiles, boltz_feats)
+        # Student forward pass — no Boltz inputs, sequence only
+        output = model(batch["protein_seq"], smiles)
 
-        # Primary objective: binary cross-entropy for interaction prediction
-        bce_loss = F.binary_cross_entropy_with_logits(
-            output["interaction_logits"], labels
-        )
+        # --- 1. Experimental loss (always) ---
+        loss = F.binary_cross_entropy_with_logits(output["interaction_logits"], labels)
 
-        # Auxiliary objective: affinity regression on positive samples
-        mask = labels > 0.5
-        affinity_loss = torch.tensor(0.0, device=device)
-        if mask.sum() > 0:
-            affinity_loss = F.mse_loss(
-                output["affinity"][mask], affinity[mask]
-            )
-
-        loss = bce_loss + 0.1 * affinity_loss
-
-        # Interaction type CE loss (positive samples only)
         pos_mask = labels > 0.5
         if pos_mask.sum() > 0:
+            loss = loss + 0.1 * F.mse_loss(
+                output["affinity"][pos_mask], affinity[pos_mask]
+            )
             itype_true = batch["interaction_type"].to(device)[pos_mask]
-            itype_logits = output["interaction_type"][pos_mask]
-            itype_loss = F.cross_entropy(itype_logits, itype_true)
-            loss = loss + 0.3 * itype_loss
+            loss = loss + 0.3 * F.cross_entropy(
+                output["interaction_type"][pos_mask], itype_true
+            )
+
+        # --- 2. Distillation loss (only where Boltz data exists) ---
+        if boltz_mask.sum() > 0:
+            pred_probs = torch.sigmoid(output["interaction_logits"][boltz_mask])
+            distill_bind = F.binary_cross_entropy(pred_probs, boltz_binding_prob[boltz_mask])
+            distill_aff  = F.mse_loss(output["affinity"][boltz_mask], boltz_affinity[boltz_mask])
+            loss = loss + distill_weight * distill_bind + distill_weight * 0.1 * distill_aff
+            distill_count += 1
 
         loss.backward()
-        # Gradient clipping for stability
         torch.nn.utils.clip_grad_norm_(model.parameters(), max_norm=1.0)
         optimizer.step()
 
         total_loss += loss.item()
         preds = (torch.sigmoid(output["interaction_logits"]) > 0.5).float()
         correct += (preds == labels).sum().item()
-        total += labels.size(0)
+        total   += labels.size(0)
 
-        # Periodically flush the MPS allocator to prevent fragmentation buildup
         if hasattr(torch, "mps") and torch.backends.mps.is_available():
-            if batch_idx % 100 == 0:
+            if batch_idx % 10 == 0:
                 torch.mps.empty_cache()
 
     return {
-        "loss": total_loss / max(len(dataloader), 1),
-        "accuracy": correct / max(total, 1),
+        "loss":          total_loss / max(len(dataloader), 1),
+        "accuracy":      correct / max(total, 1),
+        "distill_count": distill_count,
     }
 
 
-def evaluate_hybrid(
-    model: HybridP2MModel,
+def evaluate_distilled(
+    model: "ProteinMoleculeModel",
     dataloader: DataLoader,
     device: torch.device,
 ) -> Dict[str, float]:
     """
-    Evaluate the hybrid model on a dataloader.
+    Evaluate the distilled student model.
 
-    Returns
-    -------
-    dict with keys: ``loss``, ``accuracy``, ``auc``, ``f1``,
-    ``affinity_rmse``.
+    Boltz-2 features are NOT passed to the model — evaluation measures pure
+    student performance. An additional metric ``boltz_alignment`` reports how
+    often the student's binary prediction agrees with Boltz-2's on the subset
+    of pairs where Boltz data is available.
     """
     model.eval()
-    all_labels: List[float] = []
-    all_probs: List[float] = []
+    all_labels:          List[float] = []
+    all_probs:           List[float] = []
     all_affinities_true: List[float] = []
     all_affinities_pred: List[float] = []
-    total_loss = 0.0
-    correct = 0
-    total = 0
-    itype_correct = 0
-    itype_total = 0
+    total_loss   = 0.0
+    correct = total = 0
+    itype_correct = itype_total = 0
+    distill_agree = distill_total = 0
 
     with torch.no_grad():
         for batch in tqdm(dataloader, desc="Evaluating", leave=False):
-            labels = batch["label"].to(device)
-            smiles = batch["smiles"].to(device)
-            affinity = batch["affinity"].to(device)
+            labels      = batch["label"].to(device)
+            smiles      = batch["smiles"].to(device)
+            affinity    = batch["affinity"].to(device)
             boltz_feats = batch["boltz_features"].to(device)
 
-            output = model(batch["protein_seq"], smiles, boltz_feats)
+            # Student forward — no Boltz inputs
+            output = model(batch["protein_seq"], smiles)
 
-            loss = F.binary_cross_entropy_with_logits(
+            total_loss += F.binary_cross_entropy_with_logits(
                 output["interaction_logits"], labels
-            )
-            total_loss += loss.item()
+            ).item()
 
             probs = torch.sigmoid(output["interaction_logits"])
             preds = (probs > 0.5).float()
             correct += (preds == labels).sum().item()
-            total += labels.size(0)
-
+            total   += labels.size(0)
             all_labels.extend(labels.cpu().tolist())
             all_probs.extend(probs.cpu().tolist())
 
-            # Collect affinity data for positive samples only
-            mask = labels > 0.5
-            if mask.sum() > 0:
-                all_affinities_true.extend(affinity[mask].cpu().tolist())
-                all_affinities_pred.extend(
-                    output["affinity"][mask].cpu().tolist()
-                )
-
-            # Interaction type accuracy (positive samples only)
             pos_mask = labels > 0.5
             if pos_mask.sum() > 0:
+                all_affinities_true.extend(affinity[pos_mask].cpu().tolist())
+                all_affinities_pred.extend(output["affinity"][pos_mask].cpu().tolist())
                 itype_true = batch["interaction_type"].to(device)[pos_mask]
                 itype_pred = output["interaction_type"][pos_mask].argmax(dim=-1)
                 itype_correct += (itype_pred == itype_true).sum().item()
-                itype_total += pos_mask.sum().item()
+                itype_total   += pos_mask.sum().item()
+
+            # Boltz alignment — student vs teacher agreement on cached pairs
+            boltz_mask = boltz_feats[:, 2] > 0.0
+            if boltz_mask.sum() > 0:
+                teacher_preds = (boltz_feats[:, 1][boltz_mask] > 0.5).float()
+                distill_agree += (preds[boltz_mask] == teacher_preds).sum().item()
+                distill_total += boltz_mask.sum().item()
 
     labels_arr = np.array(all_labels)
-    probs_arr = np.array(all_probs)
-
-    # AUC — gracefully handle single-class batches
-    auc = (
-        float(roc_auc_score(labels_arr, probs_arr))
-        if len(np.unique(labels_arr)) > 1
-        else 0.5
-    )
-
-    preds_arr = (probs_arr > 0.5).astype(float)
+    probs_arr  = np.array(all_probs)
+    auc = (float(roc_auc_score(labels_arr, probs_arr))
+           if len(np.unique(labels_arr)) > 1 else 0.5)
     _, _, f1, _ = precision_recall_fscore_support(
-        labels_arr, preds_arr, average="binary", zero_division=0
+        labels_arr, (probs_arr > 0.5).astype(float),
+        average="binary", zero_division=0,
     )
-
     affinity_rmse = (
-        float(
-            np.sqrt(mean_squared_error(all_affinities_true, all_affinities_pred))
-        )
-        if all_affinities_true
-        else 0.0
+        float(np.sqrt(mean_squared_error(all_affinities_true, all_affinities_pred)))
+        if all_affinities_true else 0.0
     )
 
     return {
-        "loss": total_loss / max(len(dataloader), 1),
-        "accuracy": correct / max(total, 1),
-        "auc": auc,
-        "f1": float(f1),
-        "affinity_rmse": affinity_rmse,
+        "loss":                     total_loss / max(len(dataloader), 1),
+        "accuracy":                 correct / max(total, 1),
+        "auc":                      auc,
+        "f1":                       float(f1),
+        "affinity_rmse":            affinity_rmse,
         "interaction_type_accuracy": itype_correct / max(itype_total, 1),
+        "boltz_alignment":          distill_agree / max(distill_total, 1),
     }
 
 
@@ -820,15 +847,15 @@ def _save_hybrid_checkpoint(
             "scheduler_state_dict": scheduler.state_dict(),
             "best_auc": best_auc,
             "patience_counter": patience_counter,
-            "hidden_dim": model.hidden_dim,
+            "hidden_dim": getattr(model, "hidden_dim", 512),
             "history": history,
         },
         path,
     )
 
 
-def train_hybrid_model(
-    model: HybridP2MModel,
+def train_distilled_model(
+    model: "ProteinMoleculeModel",
     train_loader: DataLoader,
     val_loader: DataLoader,
     epochs: int,
@@ -836,68 +863,42 @@ def train_hybrid_model(
     device: torch.device,
     save_path: Path,
     patience: int = 10,
+    distill_weight: float = 0.5,
     resume_path: Path = None,
 ) -> Dict[str, List[float]]:
     """
-    Full training loop with early stopping for the ``HybridP2MModel``.
+    Full distillation training loop with early stopping.
 
-    Uses AdamW with a ReduceLROnPlateau scheduler (monitors validation AUC).
-    Two checkpoints are written:
-      - ``save_path``         — best model by validation AUC
-      - ``save_path.latest``  — most recent epoch (always, for reliable resume)
-
-    Parameters
-    ----------
-    model : HybridP2MModel
-    train_loader, val_loader : DataLoader
-    epochs : int
-    lr : float
-    device : torch.device
-    save_path : Path
-        Where to write the best model checkpoint (.pt).
-    patience : int
-        Number of epochs without improvement before early stopping.
-    resume_path : Path, optional
-        Checkpoint to resume from (restores model, optimizer, scheduler,
-        history, and epoch counter).
-
-    Returns
-    -------
-    Training history dict with lists: ``train_loss``, ``val_loss``,
-    ``val_auc``, ``val_f1``, ``val_affinity_rmse``.
+    Saves two checkpoints:
+      save_path          — best model by validation AUC
+      save_path.latest   — most recent epoch (always, for reliable resume)
     """
-    # Only optimise parameters that require gradients (respects freeze_base)
     optimizer = torch.optim.AdamW(
         filter(lambda p: p.requires_grad, model.parameters()),
-        lr=lr,
-        weight_decay=0.01,
+        lr=lr, weight_decay=0.01,
     )
     scheduler = torch.optim.lr_scheduler.ReduceLROnPlateau(
-        optimizer, mode="max", factor=0.5, patience=3
+        optimizer, mode="max", factor=0.5, patience=3,
     )
 
     best_auc = 0.0
     patience_counter = 0
     history: Dict[str, List[float]] = {
-        "train_loss": [],
-        "val_loss": [],
-        "val_auc": [],
-        "val_f1": [],
-        "val_affinity_rmse": [],
+        "train_loss": [], "val_loss": [], "val_auc": [], "val_f1": [],
+        "val_affinity_rmse": [], "boltz_alignment": [],
     }
     start_epoch = 0
 
-    # Restore from checkpoint if requested
     if resume_path and Path(resume_path).exists():
         print(f"\n  Resuming from checkpoint: {resume_path}")
         ckpt = torch.load(resume_path, map_location=device, weights_only=False)
         model.load_state_dict(ckpt["model_state_dict"])
         optimizer.load_state_dict(ckpt["optimizer_state_dict"])
         scheduler.load_state_dict(ckpt["scheduler_state_dict"])
-        best_auc        = ckpt.get("best_auc", 0.0)
+        best_auc         = ckpt.get("best_auc", 0.0)
         patience_counter = ckpt.get("patience_counter", 0)
-        history         = ckpt.get("history", history)
-        start_epoch     = ckpt["epoch"] + 1
+        history          = ckpt.get("history", history)
+        start_epoch      = ckpt["epoch"] + 1
         print(f"  Resumed at epoch {start_epoch + 1} | best AUC so far: {best_auc:.4f}")
     elif resume_path:
         print(f"  ⚠  Resume checkpoint not found at {resume_path} — starting fresh")
@@ -905,37 +906,39 @@ def train_hybrid_model(
     latest_path = Path(save_path).with_suffix(".latest.pt")
 
     print("\n" + "=" * 70)
-    print("HYBRID P2M MODEL — TRAINING")
+    print("P2M DISTILLATION TRAINING  (Boltz-2 as teacher)")
     print("=" * 70)
+    print(f"  Distillation weight: {distill_weight}")
+    print(f"  (0 = experimental labels only | 1 = equally weighted)")
 
     for epoch in range(start_epoch, epochs):
         print(f"\nEpoch {epoch + 1}/{epochs}")
 
-        train_m = train_hybrid_epoch(model, train_loader, optimizer, device)
-        val_m = evaluate_hybrid(model, val_loader, device)
-
+        train_m = train_distillation_epoch(
+            model, train_loader, optimizer, device, distill_weight
+        )
+        val_m = evaluate_distilled(model, val_loader, device)
         scheduler.step(val_m["auc"])
 
-        print(
-            f"  Train → Loss: {train_m['loss']:.4f} | "
-            f"Acc: {train_m['accuracy']:.4f}"
-        )
-        print(
-            f"  Val   → Loss: {val_m['loss']:.4f} | "
-            f"Acc: {val_m['accuracy']:.4f} | "
-            f"AUC: {val_m['auc']:.4f} | "
-            f"F1: {val_m['f1']:.4f}"
-        )
+        print(f"  Train → Loss: {train_m['loss']:.4f} | Acc: {train_m['accuracy']:.4f}"
+              f" | Distill batches: {train_m['distill_count']}")
+        print(f"  Val   → Loss: {val_m['loss']:.4f} | Acc: {val_m['accuracy']:.4f} | "
+              f"AUC: {val_m['auc']:.4f} | F1: {val_m['f1']:.4f}")
         if val_m["affinity_rmse"] > 0:
             print(f"  Affinity RMSE: {val_m['affinity_rmse']:.4f}")
+        if val_m["interaction_type_accuracy"] > 0:
+            print(f"  Interaction Type Acc: {val_m['interaction_type_accuracy']:.4f}")
+        if val_m["boltz_alignment"] > 0:
+            print(f"  Boltz Alignment: {val_m['boltz_alignment']:.4f}  "
+                  f"(student–teacher agreement on {val_m['boltz_alignment']*100:.1f}% of cached pairs)")
 
         history["train_loss"].append(train_m["loss"])
         history["val_loss"].append(val_m["loss"])
         history["val_auc"].append(val_m["auc"])
         history["val_f1"].append(val_m["f1"])
         history["val_affinity_rmse"].append(val_m["affinity_rmse"])
+        history["boltz_alignment"].append(val_m["boltz_alignment"])
 
-        # Always save latest checkpoint so training can be resumed at any point
         _save_hybrid_checkpoint(
             latest_path, model, optimizer, scheduler,
             epoch, best_auc, patience_counter, history,
@@ -956,7 +959,7 @@ def train_hybrid_model(
                 break
 
     print("\n" + "=" * 70)
-    print(f"Training complete.  Best validation AUC: {best_auc:.4f}")
+    print(f"Distillation complete. Best validation AUC: {best_auc:.4f}")
     print("=" * 70)
     return history
 
@@ -1026,17 +1029,19 @@ def main() -> None:
         help="Path to pre-computed ESM-2 embedding cache (.pt) from precompute_esm.py. "
              "Skips loading ESM-2 entirely and removes the main training bottleneck.",
     )
+    parser.add_argument(
+        "--distill-weight",
+        type=float,
+        default=0.5,
+        help="Weight for Boltz-2 distillation loss (0=disabled, 1=equal to experimental). "
+             "Only applied where Boltz cache data exists. Default: 0.5",
+    )
 
     parser.add_argument(
         "--patience",
         type=int,
         default=10,
         help="Early-stopping patience (epochs without AUC improvement)",
-    )
-    parser.add_argument(
-        "--freeze-base",
-        action="store_true",
-        help="Freeze base model weights and only train the fusion layers",
     )
 
     # --- Direct inference mode ---
@@ -1164,8 +1169,8 @@ def main() -> None:
         collate_fn=collate_fn,
     )
 
-    # Build base ProteinMoleculeModel
-    base_model = ProteinMoleculeModel(
+    # Student model — ProteinMoleculeModel trained via distillation
+    model = ProteinMoleculeModel(
         protein_dim=512,
         molecule_dim=512,
         hidden_dim=512,
@@ -1176,32 +1181,17 @@ def main() -> None:
     if args.base_checkpoint:
         base_ckpt_path = Path(args.base_checkpoint)
         if base_ckpt_path.exists():
-            ckpt = torch.load(base_ckpt_path, map_location=device)
+            ckpt = torch.load(base_ckpt_path, map_location=device, weights_only=False)
             state = ckpt.get("model_state_dict", ckpt)
-            missing, unexpected = base_model.load_state_dict(state, strict=False)
-            print(
-                f"✓  Loaded base weights from {base_ckpt_path} "
-                f"(missing={len(missing)}, unexpected={len(unexpected)})"
-            )
+            missing, unexpected = model.load_state_dict(state, strict=False)
+            print(f"✓  Loaded base weights from {base_ckpt_path} "
+                  f"(missing={len(missing)}, unexpected={len(unexpected)})")
         else:
-            print(
-                f"⚠  Base checkpoint not found: {base_ckpt_path}. "
-                "Using random initialisation."
-            )
+            print(f"⚠  Base checkpoint not found: {base_ckpt_path} — using random init")
 
-    # Build hybrid model
-    model = HybridP2MModel(
-        base_model=base_model,
-        hidden_dim=512,
-        freeze_base=args.freeze_base,
-    ).to(device)
-
-    total_params = sum(p.numel() for p in model.parameters())
+    total_params    = sum(p.numel() for p in model.parameters())
     trainable_params = sum(p.numel() for p in model.parameters() if p.requires_grad)
-    print(
-        f"HybridP2MModel: {total_params:,} total params | "
-        f"{trainable_params:,} trainable"
-    )
+    print(f"ProteinMoleculeModel (student): {total_params:,} total | {trainable_params:,} trainable")
 
     # Run training
     save_path = Path(args.checkpoint)
@@ -1216,7 +1206,7 @@ def main() -> None:
         if not resume_path.exists():
             print(f"  ⚠  Resume file not found: {resume_path}")
 
-    history = train_hybrid_model(
+    history = train_distilled_model(
         model=model,
         train_loader=train_loader,
         val_loader=val_loader,
@@ -1225,6 +1215,7 @@ def main() -> None:
         device=device,
         save_path=Path(args.checkpoint),
         patience=args.patience,
+        distill_weight=args.distill_weight,
         resume_path=resume_path,
     )
 

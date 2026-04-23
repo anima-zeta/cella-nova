@@ -27,9 +27,7 @@ Usage::
 import argparse
 import hashlib
 import logging
-import subprocess
 import sys
-import tempfile
 from pathlib import Path
 from typing import List, Tuple
 
@@ -52,52 +50,7 @@ log = logging.getLogger(__name__)
 
 
 # ---------------------------------------------------------------------------
-# Local subclass: adds --accelerator support to the Boltz-2 CLI call
 # ---------------------------------------------------------------------------
-
-class _AcceleratorPredictor(BoltzP2MPredictor):
-    """
-    Thin extension of BoltzP2MPredictor that forwards ``--accelerator``
-    (``cpu`` or ``gpu``) to the underlying ``boltz predict`` command.
-    The parent class does not expose this flag, so we override ``_run_boltz``
-    to inject it without duplicating any other logic.
-    """
-
-    def __init__(self, accelerator: str = "gpu", **kwargs) -> None:
-        super().__init__(**kwargs)
-        self.accelerator = accelerator
-
-    def _run_boltz(self, protein_seq: str, smiles: str, key: str) -> dict:
-        """Override: identical to parent but adds ``--accelerator <value>``."""
-        with tempfile.TemporaryDirectory(prefix="boltz_p2m_") as raw_tmp:
-            tmpdir = Path(raw_tmp)
-
-            input_file = tmpdir / f"{key}.yaml"
-            input_file.write_text(self._build_yaml(protein_seq, smiles))
-
-            output_dir = tmpdir / "output"
-            output_dir.mkdir()
-
-            cmd: List[str] = [
-                self.boltz_bin,
-                "predict",
-                str(input_file),
-                "--out_dir", str(output_dir),
-                "--model", "boltz2",
-                "--accelerator", self.accelerator,
-            ]
-            if self.use_msa_server:
-                cmd.append("--use_msa_server")
-
-            proc = subprocess.run(cmd, capture_output=True, text=True, check=False)
-            if proc.returncode != 0:
-                raise RuntimeError(
-                    f"Boltz-2 exited with code {proc.returncode}.\n"
-                    f"stdout:\n{proc.stdout}\nstderr:\n{proc.stderr}"
-                )
-
-            return self._parse_output(output_dir, key)
-
 
 # ---------------------------------------------------------------------------
 # Data loading
@@ -105,48 +58,74 @@ class _AcceleratorPredictor(BoltzP2MPredictor):
 
 def load_p2m_data(data_dir: Path) -> List[Tuple[str, str, float, float]]:
     """
-    Read ``protein_molecule_interactions.tsv`` from *data_dir*.
+    Read protein-molecule interaction pairs from *data_dir*.
+
+    Looks for files in this order:
+      1. ``p2m_all.tsv``   — full prepared dataset (from prepare_all.py)
+      2. ``p2m_train.tsv`` — training split only
+      3. ``protein_molecule_interactions.tsv`` — raw download file (legacy)
 
     Expected TSV layout (tab-separated, first row is a header)::
 
-        index   protein_seq   smiles   label   affinity_value
+        protein_id   protein_seq   smiles   label   affinity   [interaction_type]   source
 
     Returns
     -------
     list of ``(protein_seq, smiles, label, affinity_value)`` tuples.
     Rows with missing or unparseable values are skipped with a warning.
     """
-    tsv_path = data_dir / "protein_molecule_interactions.tsv"
-    if not tsv_path.exists():
-        log.error("TSV not found: %s", tsv_path)
+    candidates = [
+        data_dir / "p2m_all.tsv",
+        data_dir / "p2m_train.tsv",
+        data_dir / "protein_molecule_interactions.tsv",
+    ]
+    tsv_path = next((p for p in candidates if p.exists()), None)
+    if tsv_path is None:
+        log.error("No interaction TSV found in %s", data_dir)
         log.error(
-            "Generate it first with:  python -m download.build_p2m_interactions"
-            "  then  python -m prepare.prepare_p2m_data"
+            "Expected one of: p2m_all.tsv, p2m_train.tsv, "
+            "protein_molecule_interactions.tsv"
+        )
+        log.error(
+            "Run:  python -m prepare.prepare_all "
+            "--data-dir data --output-dir data/prepared"
         )
         sys.exit(1)
+    log.info("Loading pairs from %s", tsv_path.name)
 
     records: List[Tuple[str, str, float, float]] = []
     skipped = 0
 
     with open(tsv_path) as fh:
-        header = fh.readline().strip().split("\t")
-        log.info("TSV columns detected: %s", header)
+        raw_header = fh.readline().strip().split("\t")
+        cols = {c.lower(): i for i, c in enumerate(raw_header)}
+        log.info("TSV columns detected: %s", raw_header)
+
+        # Resolve column indices by name with positional fallbacks so the
+        # script works with both the raw download layout and the prepared layout.
+        idx_protein  = cols.get("protein_seq", 1)
+        idx_smiles   = cols.get("smiles", 2)
+        idx_label    = cols.get("label", 3)
+        idx_affinity = cols.get("affinity", 4)
 
         for lineno, line in enumerate(fh, start=2):
             parts = line.rstrip("\n").split("\t")
-            if len(parts) < 5:
+            if len(parts) <= max(idx_protein, idx_smiles, idx_label):
                 log.warning(
-                    "Line %d: expected >= 5 columns, got %d — skipping",
+                    "Line %d: too few columns (%d) — skipping",
                     lineno, len(parts),
                 )
                 skipped += 1
                 continue
             try:
-                # index | protein_seq | smiles | label | affinity_value
-                protein_seq = parts[1].strip()
-                smiles      = parts[2].strip()
-                label       = float(parts[3])
-                affinity    = float(parts[4]) if parts[4].strip() else 0.0
+                protein_seq = parts[idx_protein].strip()
+                smiles      = parts[idx_smiles].strip()
+                label       = float(parts[idx_label])
+                affinity    = (
+                    float(parts[idx_affinity])
+                    if idx_affinity < len(parts) and parts[idx_affinity].strip()
+                    else 0.0
+                )
             except (ValueError, IndexError) as exc:
                 log.warning("Line %d: parse error (%s) — skipping", lineno, exc)
                 skipped += 1
@@ -208,8 +187,13 @@ Examples:
         help="Limit to the first N samples — useful for smoke-testing",
     )
     parser.add_argument(
-        "--accelerator", choices=["gpu", "cpu"], default="gpu",
-        help="Hardware accelerator forwarded to the Boltz-2 CLI (default: gpu)",
+        "--accelerator", choices=["gpu", "mps", "cpu"], default="cpu",
+        help=(
+            "Hardware accelerator for Boltz-2 predictions. "
+            "gpu = NVIDIA CUDA, mps = Apple Silicon, cpu = CPU only. "
+            "Default: cpu (safe on all hardware — use mps on Apple Silicon "
+            "for ~3-5x speedup, gpu on Linux/Windows with NVIDIA GPU)."
+        ),
     )
     parser.add_argument(
         "--use-msa-server", action=argparse.BooleanOptionalAction, default=True,
@@ -263,10 +247,10 @@ def main() -> None:  # noqa: C901
     total = len(records)
 
     # ------------------------------------------------------------------
-    # Build the predictor (subclass forwards --accelerator to the CLI)
+    # Build predictor
     # ------------------------------------------------------------------
     args.cache_dir.mkdir(parents=True, exist_ok=True)
-    predictor = _AcceleratorPredictor(
+    predictor = BoltzP2MPredictor(
         cache_dir=args.cache_dir,
         use_msa_server=args.use_msa_server,
         accelerator=args.accelerator,
