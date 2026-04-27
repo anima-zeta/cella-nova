@@ -1,51 +1,29 @@
 #!/usr/bin/env python3
 """
-Boltz-2 Integration for Protein-Molecule Interaction Prediction
-===============================================================
+Boltz-2 Knowledge Distillation for Protein-Molecule Interaction Prediction
+======================================================================
 
-This module integrates Boltz-2 structural predictions with the
-ProteinMoleculeModel to enable two complementary workflows:
+This module implements knowledge distillation where Boltz-2 acts as a teacher
+model to train the ProteinMoleculeModel student. Pre-computed Boltz-2 structural
+features are used as soft labels during training via the ``BoltzEnhancedDataset``.
 
-**Mode 1: Direct Inference (BoltzP2MPredictor)**
-    Uses the Boltz-2 CLI to generate structure predictions and extract
-    confidence metrics (affinity, pLDDT, ipTM) for a given protein–ligand
-    pair. Results are cached by MD5 hash to avoid redundant computation.
+The ``BoltzP2MPredictor`` class is provided for cache generation (used by
+``download/download_boltz_features.py``) but direct inference via this script
+is not supported—training only.
 
-    Usage::
+Usage::
 
-        predictor = BoltzP2MPredictor(cache_dir="data/boltz_cache")
-        result = predictor.predict(
-            protein_seq="MKTAYIAKQ...",
-            smiles="CC(=O)Oc1ccccc1C(=O)O",
-        )
-        # result keys: affinity_pred_value, affinity_probability_binary,
-        #              ligand_iptm, complex_plddt, confidence_score,
-        #              structure_path
+    # Pre-populate cache (run once, can take hours):
+    predictor = BoltzP2MPredictor(cache_dir="data/boltz_cache")
+    predictor.predict_batch(protein_seqs, smiles_list)
 
-        # Or from the CLI:
-        python model_boltz_p2m.py \\
-            --predict \\
-            --protein "MKTAYIAKQ..." \\
-            --smiles "CC(=O)Oc1ccccc1C(=O)O" \\
-            --use-msa-server
-
-**Mode 2: Hybrid Training (HybridP2MModel + BoltzEnhancedDataset)**
-    Combines pre-cached Boltz-2 structural features with a trained
-    ProteinMoleculeModel via a small MLP fusion network. The cache is
-    populated ahead of time by ``BoltzP2MPredictor.predict_batch()``.
-
-    Usage::
-
-        # Pre-populate cache (run once, can take hours):
-        predictor = BoltzP2MPredictor(cache_dir="data/boltz_cache")
-        predictor.predict_batch(protein_seqs, smiles_list)
-
-        # Then train the hybrid model:
-        python model_boltz_p2m.py \\
-            --data-dir data/protein_molecule \\
-            --boltz-cache data/boltz_cache \\
-            --base-checkpoint models/p2m_model.pt \\
-            --epochs 30
+    # Then train the distilled model:
+    python model_boltz_p2m.py \\
+        --data-dir data/protein_molecule \\
+        --boltz-cache data/boltz_cache \\
+        --base-checkpoint models/p2m_model.pt \\
+        --epochs 30 \\
+        --distill-weight 0.5
 """
 
 import argparse
@@ -1044,30 +1022,6 @@ def main() -> None:
         help="Early-stopping patience (epochs without AUC improvement)",
     )
 
-    # --- Direct inference mode ---
-    parser.add_argument(
-        "--predict",
-        action="store_true",
-        help="Run Boltz-2 directly on a single protein–ligand pair and exit",
-    )
-    parser.add_argument(
-        "--protein",
-        type=str,
-        default=None,
-        help="Amino acid sequence for --predict mode",
-    )
-    parser.add_argument(
-        "--smiles",
-        type=str,
-        default=None,
-        help="Ligand SMILES string for --predict mode",
-    )
-    parser.add_argument(
-        "--use-msa-server",
-        action="store_true",
-        help="Pass --use_msa_server to the Boltz-2 CLI (requires internet)",
-    )
-
     args = parser.parse_args()
 
     # ------------------------------------------------------------------
@@ -1085,41 +1039,10 @@ def main() -> None:
     print(f"[boltz_p2m] Device: {device}")
 
     # ==================================================================
-    # Mode 1: Direct Boltz-2 inference
-    # ==================================================================
-    if args.predict:
-        if not args.protein or not args.smiles:
-            parser.error("--predict requires both --protein and --smiles")
-
-        predictor = BoltzP2MPredictor(
-            cache_dir=args.boltz_cache,
-            use_msa_server=args.use_msa_server,
-        )
-
-        truncated = (
-            args.protein[:60] + "..." if len(args.protein) > 60 else args.protein
-        )
-        print(f"\nRunning Boltz-2 prediction …")
-        print(f"  Protein : {truncated}")
-        print(f"  SMILES  : {args.smiles}")
-
-        result = predictor.predict(args.protein, args.smiles)
-
-        print("\n--- Boltz-2 Results ---")
-        for key, val in result.items():
-            print(f"  {key}: {val}")
-
-        tensor_out = predictor.to_model_output(result)
-        prob = torch.sigmoid(tensor_out["interaction_logits"]).item()
-        print(f"\n  Interaction probability : {prob:.4f}")
-        print(f"  Predicted affinity      : {tensor_out['affinity'].item():.4f}")
-        return
-
-    # ==================================================================
-    # Mode 2: Hybrid model training
+    # Hybrid model training
     # ==================================================================
     if not args.data_dir:
-        parser.error("--data-dir is required for training mode (or use --predict)")
+        parser.error("--data-dir is required")
 
     data_dir   = Path(args.data_dir)
     train_file = data_dir / "p2m_train.tsv"
