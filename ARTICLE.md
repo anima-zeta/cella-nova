@@ -54,16 +54,47 @@ The result is a model that maintains the **inference speed of a sequence-based n
 The impact of the hybrid approach is evident in the performance metrics. When tested on held-out human target data from ChEMBL, the Hybrid model consistently outperformed the Full sequence-based model.
 
 ### Binding Classification (AUC-ROC)
-| Model | AUC-ROC |
-|-------|---------|
-| Full Model | 0.91 |
-| **Hybrid Model** | **0.94** |
+<table>
+  <thead>
+    <tr>
+      <th>Model</th>
+      <th>AUC-ROC</th>
+    </tr>
+  </thead>
+  <tbody>
+    <tr>
+      <td>Full Model</td>
+      <td>0.91</td>
+    </tr>
+    <tr>
+      <td><strong>Hybrid Model</strong></td>
+      <td><strong>0.94</strong></td>
+    </tr>
+  </tbody>
+</table>
 
 ### Affinity Regression (pIC50)
-| Model | RMSE (Lower is better) | Pearson r (Higher is better) |
-|-------|-------------------------|------------------------------|
-| Full Model | 0.81 | 0.87 |
-| **Hybrid Model** | **0.68** | **0.91** |
+<table>
+  <thead>
+    <tr>
+      <th>Model</th>
+      <th>RMSE (Lower is better)</th>
+      <th>Pearson r (Higher is better)</th>
+    </tr>
+  </thead>
+  <tbody>
+    <tr>
+      <td>Full Model</td>
+      <td>0.81</td>
+      <td>0.87</td>
+    </tr>
+    <tr>
+      <td><strong>Hybrid Model</strong></td>
+      <td><strong>0.68</strong></td>
+      <td><strong>0.91</strong></td>
+    </tr>
+  </tbody>
+</table>
 
 The reduction in RMSE (from 0.81 to 0.68) represents a significant leap in the precision of affinity predictions, moving us closer to a reliable "digital assay."
 
